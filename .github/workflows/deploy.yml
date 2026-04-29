@@ -1,9 +1,5 @@
 name: Deploy to MSBX Sandbox
 
-# Auto-runs on first push. Deploys to AWS EKS or Azure AKS based on
-# the targetCloud parameter chosen during scaffolding.
-# Uses GitHub OIDC for AWS (no static keys) and Azure credentials for AKS.
-
 on:
   push:
     branches: [main]
@@ -17,32 +13,31 @@ env:
   TARGET_CLOUD: aws
   SERVICE_NAME: test-springboot-6
   COST_CENTER: MC-1234
-  # AWS config
   AWS_REGION: us-west-2
   AWS_ACCOUNT_ID: '447558490768'
   ECR_REPO: mastercard/test-springboot-6
   EKS_CLUSTER: mastercard-msbx-eks
-  # Azure config
   AZURE_RG: msbx-rg-us
   AKS_CLUSTER: mastercard-msbx-aks
   SANDBOX_NAMESPACE: sandbox-test-springboot-6
 
 jobs:
-  # ── AWS Deploy (EKS) ─────────────────────────────────────────────────────
-  deploy-aws:
-    if: ${{ env.TARGET_CLOUD == 'aws' }}
+  deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
+      # ── AWS Steps ─────────────────────────────────────────────────────
       - name: Configure AWS via OIDC
+        if: env.TARGET_CLOUD == 'aws'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/mastercard-msbx-scaffolded-deploy
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Ensure ECR repository exists
+        if: env.TARGET_CLOUD == 'aws'
         run: |
           aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" >/dev/null 2>&1 \
             || aws ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_REGION" \
@@ -50,11 +45,13 @@ jobs:
                  --tags Key=Tenant,Value=mastercard Key=CostCenter,Value=$COST_CENTER
 
       - name: ECR login
+        if: env.TARGET_CLOUD == 'aws'
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build + push image
-        id: img
+      - name: Build + push to ECR
+        if: env.TARGET_CLOUD == 'aws'
+        id: img-aws
         run: |
           TAG="${GITHUB_SHA::8}-$(date -u +%Y%m%d%H%M)"
           URI="${{ steps.ecr.outputs.registry }}/$ECR_REPO:$TAG"
@@ -63,13 +60,12 @@ jobs:
           docker push "${{ steps.ecr.outputs.registry }}/$ECR_REPO:latest"
           echo "uri=$URI" >> $GITHUB_OUTPUT
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-
-      - name: Update kubeconfig
+      - name: Update kubeconfig (EKS)
+        if: env.TARGET_CLOUD == 'aws'
         run: aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION"
 
-      - name: Provision namespace + deploy
+      - name: Deploy to EKS
+        if: env.TARGET_CLOUD == 'aws'
         run: |
           kubectl get namespace "$SANDBOX_NAMESPACE" >/dev/null 2>&1 \
             || kubectl create namespace "$SANDBOX_NAMESPACE"
@@ -90,41 +86,33 @@ jobs:
               limits.memory: 8Gi
               pods: "10"
           EOF
-          sed -i "s|IMAGE_PLACEHOLDER|${{ steps.img.outputs.uri }}|g" k8s/deployment.yaml
+          sed -i "s|IMAGE_PLACEHOLDER|${{ steps.img-aws.outputs.uri }}|g" k8s/deployment.yaml
           kubectl apply -f k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/ingress.yaml
           kubectl rollout status deployment/$SERVICE_NAME -n $SANDBOX_NAMESPACE --timeout=5m
 
-      - name: Print sandbox URL
+      - name: Print AWS sandbox URL
+        if: env.TARGET_CLOUD == 'aws'
         run: |
-          for i in {1..30}; do
+          for i in {1..20}; do
             HOST=$(kubectl get ingress "$SERVICE_NAME" -n "$SANDBOX_NAMESPACE" \
                      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-            if [ -n "$HOST" ]; then
-              echo "Sandbox live at: http://$HOST"
-              break
-            fi
+            if [ -n "$HOST" ]; then echo "Sandbox live at: http://$HOST"; break; fi
             sleep 10
           done
 
-  # ── Azure Deploy (AKS) ───────────────────────────────────────────────────
-  deploy-azure:
-    if: ${{ env.TARGET_CLOUD == 'azure' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-
+      # ── Azure Steps ───────────────────────────────────────────────────
       - name: Azure Login
+        if: env.TARGET_CLOUD == 'azure'
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Build + push to ACR
+        if: env.TARGET_CLOUD == 'azure'
         run: |
           ACR_NAME="mastercardmsbxacr"
-          # Create ACR if needed (first deploy)
           az acr show --name $ACR_NAME --resource-group $AZURE_RG >/dev/null 2>&1 \
             || az acr create --name $ACR_NAME --resource-group $AZURE_RG --sku Basic --admin-enabled true
           az acr login --name $ACR_NAME
@@ -135,13 +123,12 @@ jobs:
           docker push "$ACR_NAME.azurecr.io/$SERVICE_NAME:latest"
           echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-
       - name: Get AKS credentials
+        if: env.TARGET_CLOUD == 'azure'
         run: az aks get-credentials --name $AKS_CLUSTER --resource-group $AZURE_RG --overwrite-existing
 
-      - name: Provision namespace + deploy
+      - name: Deploy to AKS
+        if: env.TARGET_CLOUD == 'azure'
         run: |
           kubectl get namespace "$SANDBOX_NAMESPACE" >/dev/null 2>&1 \
             || kubectl create namespace "$SANDBOX_NAMESPACE"
@@ -168,9 +155,14 @@ jobs:
           kubectl rollout status deployment/$SERVICE_NAME -n $SANDBOX_NAMESPACE --timeout=5m
           echo "Deployed to AKS namespace: $SANDBOX_NAMESPACE"
 
-      - name: Print sandbox info
+      # ── Summary ───────────────────────────────────────────────────────
+      - name: Summary
+        if: always()
         run: |
-          SVC_IP=$(kubectl get svc "$SERVICE_NAME" -n "$SANDBOX_NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
-          echo "Sandbox live at: http://$SVC_IP"
-          echo "Namespace: $SANDBOX_NAMESPACE"
-          echo "Cluster: $AKS_CLUSTER"
+          echo "## MSBX Sandbox Deploy" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | $SERVICE_NAME |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cloud | $TARGET_CLOUD |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | $SANDBOX_NAMESPACE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cost Center | $COST_CENTER |" >> $GITHUB_STEP_SUMMARY
